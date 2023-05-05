@@ -1,5 +1,8 @@
 # GPTFren
 
+A lil` chat friend you can press a key and talk to and it will respond.
+Holds a memory of short-term conversation and long-term conversation using [HyperDB](https://github.com/jdagdelen/hyperDB)
+
 ## Requirements
 
 - Python
@@ -24,3 +27,7 @@ Run `python main.py`
 Select your microphone
 
 Hold the activation key (default: `F10`) to record your speech, release when done.
+
+## TODO
+
+Better TTS
