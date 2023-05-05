@@ -1,23 +1,47 @@
+import warnings
+from numba.core.errors import NumbaDeprecationWarning
+# i don't give a hoot
+warnings.simplefilter('ignore', category=NumbaDeprecationWarning)
+
 import io
+import keyboard
+import openai
 import os
 import pyaudio
-import requests
-import json
 import wave
 import whisper
-import keyboard
+from dotenv import load_dotenv
+from gtts import gTTS
+from hyperdb import HyperDB
 from pydub import AudioSegment
 from pydub.utils import make_chunks
-from gtts import gTTS
 from uuid import uuid4
-from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
-WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE")
-CHATGPT_API_KEY = os.getenv("CHATGPT_API_KEY")
-DEFAULT_MIC_INDEX = os.getenv("DEFAULT_MIC_INDEX")
+WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE") or "tiny"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GPT_MODEL= os.getenv("GPT_MODEL") or "gpt-3.5-turbo"
+MIC_INDEX = os.getenv("MIC_INDEX")
+ACTIVATION_KEY = os.getenv("ACTIVATION_KEY") or "f10"
+SHORT_MEMORY_LINES = os.getenv("SHORT_MEMORY_LINES") or 5
+LONG_MEMORY_LINES = os.getenv("LONG_MEMORY_LINES") or 5
 
+if not OPENAI_API_KEY:
+   raise Exception("OPENAI_API_KEY environment variable not set")
+openai.api_key = OPENAI_API_KEY
+
+# Load vector DB
+# If no existing memory, delay creation until first document is available
+db = None
+if(os.path.exists("data/memory.pickle.gz")):
+  db = HyperDB()
+  db.load("data/memory.pickle.gz")
+
+# Init short term memory
+short_memory = []
+
+# Query the HyperDB instance with a text input
 def list_audio_devices():
     audio = pyaudio.PyAudio()
     device_count = audio.get_device_count()
@@ -31,15 +55,16 @@ def list_audio_devices():
     return devices
 
 def select_microphone(devices):
-    if(DEFAULT_MIC_INDEX != None):
-      return int(DEFAULT_MIC_INDEX)
+    if(MIC_INDEX != None):
+      idx = int(MIC_INDEX)
+      print("Using default microphone: ", devices[idx][1]["name"])
+      return idx
+    
     print("Select the microphone to use:")
     for i, device_info in devices:
         print(f"{i}: {device_info['name']}")
 
     selected_index = int(input("Enter the index of the microphone: "))
-    print("\nSelected microphone information:")
-    print(json.dumps(devices[selected_index][1], indent=2))
     return devices[selected_index][0]
   
 def record_audio(device_index, rate=16000, chunk_size=1024):
@@ -49,16 +74,16 @@ def record_audio(device_index, rate=16000, chunk_size=1024):
 
     stream = audio.open(format=pyaudio.paInt32, rate=rate, channels=channels, input=True, frames_per_buffer=chunk_size, input_device_index=device_index)
 
-    print("Hold the spacebar to record audio, release to stop recording and send to Whisper.")
+    print(f"\nHold down {str.upper(ACTIVATION_KEY)} to record audio, release to stop.")
     frames = []
 
     while True:
-        if keyboard.is_pressed('space'):
+        if keyboard.is_pressed(ACTIVATION_KEY):
             print("Recording...", end="\r")
             data = stream.read(chunk_size)
             frames.append(data)
         elif frames:
-            print("Stopped recording. Sending audio to Whisper...")
+            print("Processing...")
             break
 
     stream.stop_stream()
@@ -68,28 +93,40 @@ def record_audio(device_index, rate=16000, chunk_size=1024):
     audio_data = b''.join(frames)
     return audio_data
 
+def get_prompt_memory(prompt):
+    relative_context = ""
+    if db:
+        for doc in db.query(prompt)[:int(LONG_MEMORY_LINES)]:
+            relative_context += doc[0]
+
+    sm_string = ""
+    for sm in short_memory:
+         sm_string += f"{str(sm)}\n"
+    
+    return f"""
+      Relative context:
+        {relative_context}
+      Previous conversation:
+        {sm_string}
+    """
+
 def send_to_chatgpt(prompt):
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {CHATGPT_API_KEY}"
-    }
-    print(headers)
-    url = "https://api.openai.com/v1/chat/completions"
-    data = {
-        "model": "gpt-3.5-turbo",
-        "messages": [
-            {"role": "system", "content": "You are a helpful assistant. You answer briefly and succinctly."},
-            {"role": "user", "content": prompt}
-        ]
-    }
-
-    response = requests.post(url, headers=headers, json=data)
-
-    if response.status_code == 200:
-        return response.json()["choices"][0]["message"]["content"]
-    else:
-        print(f"Error {response.status_code}: {response.text}")
-        return None
+    memory_string = get_prompt_memory(prompt)
+    completion = openai.ChatCompletion.create(
+      model="gpt-3.5-turbo",
+      messages=[
+       {
+          "role": "system",
+          "content": f"""
+            You are a helpful assistant. You answer briefly and succinctly.
+            You use this context in order to respond:
+            {memory_string}
+          """
+        },
+        {"role": "user", "content": prompt}
+      ]
+    )
+    return completion.choices[0].message["content"]
 
 def write_audio_to_file(audio_data, filepath, channels=1, rate=16000):
     with wave.open(filepath, 'wb') as wf:
@@ -131,13 +168,12 @@ if __name__ == "__main__":
       model = whisper.load_model(WHISPER_MODEL_SIZE or "base")
       devices = list_audio_devices()
       device_index = select_microphone(devices)
-      print(f"Using microphone {device_index}")
     
       while True:
         filepath = f"temp\\{str(uuid4())}.wav"
         audio_data = record_audio(device_index)
         write_audio_to_file(audio_data, filepath)
-        transcribed_text = model.transcribe(filepath)['text']
+        transcribed_text = model.transcribe(filepath, fp16=False)['text']
         os.remove(filepath)
         print(f"Transcribed text: {transcribed_text}")
 
@@ -147,7 +183,17 @@ if __name__ == "__main__":
             if chatgpt_response:
                 audio_file = synthesize_speech(chatgpt_response)
                 play_audio_data(audio_file)
+                if db is None:
+                    db = HyperDB()
+                db.add_document(f"Query: {transcribed_text}\n\tResponse: {chatgpt_response}\n\n")
+                short_memory.append({
+                  "user": transcribed_text,
+                  "assistant": chatgpt_response
+                })
+                short_memory = short_memory[-int(SHORT_MEMORY_LINES):]
         else:
             print("Could not transcribe audio.")
     except KeyboardInterrupt:
       print("Exiting...")
+      # Save the HyperDB instance to a file
+      db.save("data/memory.pickle.gz")
